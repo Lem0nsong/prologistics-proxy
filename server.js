@@ -5,7 +5,7 @@ const fetch = require("node-fetch");
 const app = express();
 app.use(cors());
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 const GOOGLE_API_KEY = "AIzaSyCC98qBzRglCXE_fOxPqFymJRV5kY8b-7M";
 const USER_LOCATION = "Pilotystraße 29, 90408 Nürnberg";
 
@@ -27,5 +27,5 @@ app.get("/transit", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`Proxy läuft auf http://localhost:${PORT}`);
+    console.log(`Proxy läuft auf Port ${PORT}`);
 });
