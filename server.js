@@ -13,6 +13,15 @@ const USER_LOCATION  = process.env.USER_LOCATION || 'Pilotystraße 29, 90408 Nü
 // Health
 app.get('/health', (_, res) => res.json({ ok: true }));
 
+function parseTs(input) {
+  if (input == null) return Math.floor(Date.now() / 1000);
+  const v = String(input).trim().toLowerCase();
+  if (v === 'now') return Math.floor(Date.now() / 1000);
+  const n = Number(v);
+  if (Number.isFinite(n)) return Math.floor(n);
+  return Math.floor(Date.now() / 1000);
+}
+
 // Call Google Directions (transit) at a single timestamp
 async function googleTransitOnce({ origin, destination, ts, mode }) {
   if (!GOOGLE_API_KEY) throw new Error('GOOGLE_API_KEY missing');
@@ -65,9 +74,13 @@ app.get('/transit', async (req, res) => {
     if (!destination) return res.status(400).json({ error: 'destination/ziel missing' });
 
     let baseTs, mode;
-    if (req.query.arrival_time)       { baseTs = parseInt(req.query.arrival_time, 10); mode = 'arrive'; }
-    else if (req.query.departure_time){ baseTs = parseInt(req.query.departure_time, 10); mode = 'depart'; }
-    else                              { baseTs = Math.floor(Date.now() / 1000);         mode = 'depart'; }
+    if (req.query.arrival_time != null) {
+      baseTs = parseTs(req.query.arrival_time); mode = 'arrive';
+    } else if (req.query.departure_time != null) {
+      baseTs = parseTs(req.query.departure_time); mode = 'depart';
+    } else {
+      baseTs = parseTs('now'); mode = 'depart';
+}
 
     const windowMin = Math.max(0, parseInt(req.query.window || '60', 10));
     const stepMin   = Math.max(1, parseInt(req.query.step   || '10', 10));
@@ -108,3 +121,4 @@ app.get('/transit', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Proxy listening on ${PORT}`));
+
