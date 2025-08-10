@@ -1,4 +1,4 @@
-// server.js — HERE Public Transit routing with arrival/departure + D-Ticket filter
+// HERE Public Transit proxy — arrival/departure sweep + D-Ticket filter
 const express = require('express');
 const cors = require('cors');
 
@@ -7,17 +7,14 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const HERE_API_KEY = process.env.HERE_API_KEY; // ← set in Vercel
+const HERE_API_KEY = process.env.HERE_API_KEY;
 const USER_AGENT = process.env.USER_AGENT || 'prologistics-proxy/1.0';
 
-if (!HERE_API_KEY) {
-  // Fail early so misconfig is obvious in Vercel logs
-  console.error('Missing HERE_API_KEY env var'); 
-}
+if (!HERE_API_KEY) console.error('Missing HERE_API_KEY');
 
 app.get('/health', (_, res) => res.json({ ok: true }));
 
-// ───────────────── helpers
+// Helpers
 function parseTs(input) {
   if (input == null) return Math.floor(Date.now() / 1000);
   const s = String(input).trim().toLowerCase();
@@ -25,21 +22,17 @@ function parseTs(input) {
   const n = Number(s);
   return Number.isFinite(n) ? Math.floor(n) : Math.floor(Date.now() / 1000);
 }
-// RFC3339 helper for HERE v8: 2025-08-10T13:45:00Z
 function toIsoUTC(unixSec) { return new Date(unixSec * 1000).toISOString(); }
-
 function longDistanceMatcher(name = '', shortName = '', agency = '') {
   const ln = (name || '').toUpperCase();
   const sn = (shortName || '').toUpperCase();
   const ag = (agency || '').toUpperCase();
-  // Extend as necessary
-  const re = /^(ICE|IC|EC|ECE|RJ|RJX|D|TLX)/;
+  const re = /^(ICE|IC|EC|ECE|RJ|RJX|D|TLX)/; // extend if needed
   return re.test(sn) || re.test(ln) || ag.includes('DB FERNVERKEHR');
 }
 
-// ───────────────── HERE calls
+// HERE Geocoding & Search v7
 async function geocodeHere(query, country = '') {
-  // HERE Geocoding & Search v7
   const base = 'https://geocode.search.hereapi.com/v1/geocode';
   const params = new URLSearchParams({ q: query, apiKey: HERE_API_KEY, lang: 'de-DE' });
   if (country) params.set('in', `countryCode:${country.toUpperCase()}`);
@@ -48,46 +41,30 @@ async function geocodeHere(query, country = '') {
   const j = await r.json();
   const item = j.items?.[0];
   if (!item) return { ok: false, status: 'ZERO_RESULTS' };
-  return {
-    ok: true,
-    lat: item.position?.lat,
-    lng: item.position?.lng,
-    title: item.title,
-    id: item.id || null
-  };
+  return { ok: true, lat: item.position?.lat, lng: item.position?.lng, title: item.title };
 }
 
+// HERE Transit Routing v8
 async function hereTransitRoute({ origin, destination, ts, mode, fewerTransfers, lessWalking, dticketOnly }) {
-  // HERE Public Transit Routing v8
-  // Docs: transit.router.hereapi.com/v8/routes ; supports arrivalTime/departureTime
-  // Params ref: see HERE dev guide (arrivalTime/departureTime, preferences). :contentReference[oaicite:3]{index=3}
   const base = 'https://transit.router.hereapi.com/v8/routes';
   const p = new URLSearchParams({
     apiKey: HERE_API_KEY,
     origin: `${origin.lat},${origin.lng}`,
     destination: `${destination.lat},${destination.lng}`,
-    return: 'polyline,actions,travelSummary,fares' // rich details
+    return: 'polyline,actions,travelSummary,fares'
   });
   if (mode === 'arrive') p.set('arrivalTime', toIsoUTC(ts));
   else                   p.set('departureTime', toIsoUTC(ts));
-
-  // Preferences
-  // NB: HERE has "changes" (transfers) and "walkTime" preferences via `alternatives`/`routingMode`
-  // We’ll map to reasonable equivalents:
-  if (fewerTransfers) p.set('changes', 'few');       // prefer fewer transfers
-  if (lessWalking)    p.set('walkTime', 'short');    // prefer less walking
+  if (fewerTransfers) p.set('changes', 'few');
+  if (lessWalking)    p.set('walkTime', 'short');
 
   const r = await fetch(`${base}?${p}`, { headers: { 'user-agent': USER_AGENT } });
   if (!r.ok) return { status: 'HTTP_ERROR', code: r.status };
-
   const j = await r.json();
   const route = j.routes?.[0];
   if (!route) return { status: 'ZERO_RESULTS' };
 
-  // Summarize transit sections
-  let durationSec = route.sections?.reduce((sum, s) => sum + (s.summary?.duration || 0), 0) || null;
-
-  // If D-Ticket only, ensure NO long-distance sections
+  // D-Ticket filter: drop any long-distance legs
   if (dticketOnly) {
     const hasLD = (route.sections || []).some(sec => {
       if (sec.transport?.mode !== 'transit') return false;
@@ -99,7 +76,9 @@ async function hereTransitRoute({ origin, destination, ts, mode, fewerTransfers,
     if (hasLD) return { status: 'FILTERED_LONG_DISTANCE' };
   }
 
-  // Build details list similar to Google shape
+  const duration = (route.sections || []).reduce((sum, s) => sum + (s.summary?.duration || 0), 0);
+  const transfers = Math.max(0, (route.sections || []).filter(s => s.transport?.mode === 'transit').length - 1);
+
   const details = (route.sections || []).map(sec => {
     if (sec.transport?.mode === 'transit') {
       return {
@@ -113,66 +92,42 @@ async function hereTransitRoute({ origin, destination, ts, mode, fewerTransfers,
       };
     }
     if (sec.transport?.mode === 'pedestrian') {
-      return {
-        type: 'WALK',
-        duration_sec: sec.summary?.duration || null,
-        distance_m: sec.summary?.length || null
-      };
+      return { type: 'WALK', duration_sec: sec.summary?.duration || 0, distance_m: sec.summary?.length || 0 };
     }
-    return { type: (sec.transport?.mode || 'OTHER').toUpperCase(), raw: true };
+    return { type: (sec.transport?.mode || 'OTHER').toUpperCase() };
   });
 
-  // Total transfers = count of transit sections - 1
-  const transfers = Math.max(0, (route.sections || []).filter(s => s.transport?.mode === 'transit').length - 1);
-
-  // First/last times
   const depUnix = route.sections?.[0]?.departure?.time
     ? Math.floor(new Date(route.sections[0].departure.time).getTime()/1000) : null;
   const arrUnix = route.sections?.slice(-1)[0]?.arrival?.time
     ? Math.floor(new Date(route.sections.slice(-1)[0].arrival.time).getTime()/1000) : null;
 
-  return {
-    status: 'OK',
-    provider: 'here',
-    duration: durationSec,
-    transfers,
-    details,
-    depart: depUnix,
-    arrive: arrUnix
-  };
+  return { status: 'OK', provider: 'here', duration, transfers, details, depart: depUnix, arrive: arrUnix };
 }
 
-// Evaluate multiple timestamps in a window and pick the fastest itinerary
+// Try multiple timestamps in a window, pick the fastest
 async function sweepBest({ originText, destText, baseTs, windowMin, stepMin, mode, country, fewerTransfers, lessWalking, dticketOnly, debug=false }) {
   const [o, d] = await Promise.all([ geocodeHere(originText, country), geocodeHere(destText, country) ]);
   if (!o.ok || !d.ok) return { status: 'GEOCODE_FAIL', origin:o, destination:d, trace: [] };
 
-  const candidates = [];
   const startOff = (mode === 'arrive') ? -windowMin : 0;
   const endOff   = (mode === 'arrive') ?  0        : windowMin;
+  const candidates = [];
   for (let m = startOff; m <= endOff; m += stepMin) candidates.push(baseTs + m*60);
 
-  const trace = [];
-  const tries = [];
+  const trace = [], options = [];
   for (const ts of candidates) {
-    const r = await hereTransitRoute({
-      origin: { lat:o.lat, lng:o.lng },
-      destination: { lat:d.lat, lng:d.lng },
-      ts, mode, fewerTransfers, lessWalking, dticketOnly
-    });
+    const r = await hereTransitRoute({ origin:{lat:o.lat,lng:o.lng}, destination:{lat:d.lat,lng:d.lng}, ts, mode, fewerTransfers, lessWalking, dticketOnly });
     if (debug) trace.push({ ts, status: r.status, code: r.code || null, mode });
-    if (r.status === 'OK') tries.push({ ...r, ts });
+    if (r.status === 'OK') options.push({ ...r, ts });
   }
-  if (tries.length === 0) return { status: 'ZERO_RESULTS', origin:o, destination:d, trace };
+  if (!options.length) return { status:'ZERO_RESULTS', origin:o, destination:d, trace };
 
-  // Best = shortest duration, then fewer transfers
-  tries.sort((a,b) => (a.duration - b.duration) || (a.transfers - b.transfers));
-  return { status:'OK', origin:o.title, destination:d.title, best: tries[0], provider: 'here', trace };
+  options.sort((a,b)=> (a.duration - b.duration) || (a.transfers - b.transfers));
+  return { status:'OK', provider:'here', origin:o.title, destination:d.title, best: options[0], trace };
 }
 
-// ───────────────── HTTP endpoints
-
-// /transit?origin=...&destination=...&arrival_time=UNIX | &departure_time=UNIX
+// GET /transit?origin=...&destination=...&arrival_time=UNIX | &departure_time=UNIX
 //   &window=90&step=10&country=de&dticket=1&pref=fewer_transfers|less_walking&debug=1
 app.get('/transit', async (req, res) => {
   try {
@@ -181,22 +136,20 @@ app.get('/transit', async (req, res) => {
     if (!originText || !destText) return res.status(400).json({ error: 'origin and destination required' });
 
     const mode   = (req.query.arrival_time != null) ? 'arrive'
-                    : (req.query.departure_time != null) ? 'depart' : 'depart';
+                  : (req.query.departure_time != null) ? 'depart' : 'depart';
     const baseTs = (mode === 'arrive') ? parseTs(req.query.arrival_time) : parseTs(req.query.departure_time);
-
     const windowMin = Math.max(0, parseInt(req.query.window || '60', 10));
     const stepMin   = Math.max(1, parseInt(req.query.step   || '10', 10));
     const country   = (req.query.country || '').toLowerCase();
 
-    const dticketOnly   = String(req.query.dticket || '0') === '1';
-    const pref          = (req.query.pref || '').toLowerCase();
-    const fewerTransfers= pref === 'fewer_transfers';
-    const lessWalking   = pref === 'less_walking';
+    const pref = (req.query.pref || '').toLowerCase();
+    const fewerTransfers = pref === 'fewer_transfers';
+    const lessWalking    = pref === 'less_walking';
+    const dticketOnly    = String(req.query.dticket || '0') === '1';
 
     const out = await sweepBest({
       originText, destText, baseTs, windowMin, stepMin, mode, country,
-      fewerTransfers, lessWalking, dticketOnly,
-      debug: String(req.query.debug||'') === '1'
+      fewerTransfers, lessWalking, dticketOnly, debug: String(req.query.debug||'')==='1'
     });
 
     if (out.status !== 'OK') {
@@ -209,7 +162,7 @@ app.get('/transit', async (req, res) => {
       });
     }
     const b = out.best;
-    return res.json({
+    res.json({
       status: 'OK',
       provider: out.provider,
       origin: out.origin,
