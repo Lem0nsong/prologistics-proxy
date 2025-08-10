@@ -92,11 +92,14 @@ async function hereTransitRoute({ origin, destination, ts, mode, dticketOnly }) 
     if (hasLD) return { status: 'FILTERED_LONG_DISTANCE' };
   }
 
-  const duration = (route.sections || []).reduce((sum, s) => sum + (s.summary?.duration || 0), 0);
-  const transfers = Math.max(
-    0,
-    (route.sections || []).filter(s => s.transport?.mode === 'transit').length - 1
-  );
+  // Fallback: compute duration from departure/arrival if summary is missing
+  const duration = (route.sections || []).reduce((sum, s) => {
+    const sd = s.summary?.duration;
+    if (Number.isFinite(sd)) return sum + sd;
+    const depMs = s.departure?.time ? Date.parse(s.departure.time) : null;
+    const arrMs = s.arrival?.time ? Date.parse(s.arrival.time) : null;
+    return sum + (depMs != null && arrMs != null ? Math.max(0, Math.round((arrMs - depMs) / 1000)) : 0);
+  }, 0);
 
   const details = (route.sections || []).map(sec => {
     if (sec.transport?.mode === 'transit') {
@@ -217,3 +220,4 @@ app.get('/transit', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`HERE transit proxy listening on :${PORT}`));
+
