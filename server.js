@@ -30,11 +30,13 @@ async function geocodeToPlaceId(q, country = '') {
   const p = new URLSearchParams({ address: q, key: GOOGLE_API_KEY, language: 'de' });
   if (country) p.set('components', `country:${country}`);
   const r = await fetch(`${base}?${p.toString()}`);
-  if (!r.ok) return null;
   const j = await r.json();
-  const res = j?.results?.[0];
-  if (!res) return null;
-  return { place_id: res.place_id, formatted: res.formatted_address };
+  // Return full status so we can see errors like REQUEST_DENIED, OVER_QUERY_LIMIT, etc.
+  if (j.status !== 'OK' || !j.results?.length) {
+    return { ok:false, status:j.status, error:j.error_message || null };
+  }
+  const res = j.results[0];
+  return { ok:true, place_id: res.place_id, formatted: res.formatted_address };
 }
 
 // Directions (transit) at a single timestamp, using place_ids when available
@@ -108,9 +110,11 @@ app.get('/transit', async (req, res) => {
       geocodeToPlaceId(textOrigin, country),
       geocodeToPlaceId(textDest,   country)
     ]);
-    if (!o || !d) {
-      return res.status(400).json({ status: 'GEOCODE_FAIL', origin: !!o, destination: !!d });
+    
+    if (!o.ok || !d.ok) {
+      return res.status(400).json({ status: 'GEOCODE_FAIL', origin:o, destination:d });
     }
+
 
     const startOff = (mode === 'arrive') ? -windowMin : 0;
     const endOff   = (mode === 'arrive') ? 0          : windowMin;
@@ -153,3 +157,4 @@ app.get('/transit', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Proxy listening on ${PORT}`));
+
