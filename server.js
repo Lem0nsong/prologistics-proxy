@@ -306,4 +306,159 @@ app.get('/transit', async (req, res) => {
       requested_time: baseTs,
       chosen_time: b.ts,
       duration: b.duration,
-      duration_minu_
+      duration_minutes: Math.round((b.duration || 0) / 60),
+      transfers: b.transfers ?? null,
+      walk_minutes: b.walk ?? null,
+      details: b.details || null,
+      note: out.note,
+      probed: debug ? out.trace : undefined
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'proxy_error', detail: err.message });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// /itinerary — outbound (arrive-by) + return (depart or sweep) + totals/wage
+//
+// /itinerary?provider=auto|db|google
+//   &origin=HOME_ADDRESS                 (default: USER_LOCATION)
+//   &destination=HOME_ADDRESS_FOR_RETURN (default: USER_LOCATION)
+//   &start=START_ADDRESS
+//   &ziel=ZIEL_ADDRESS
+//   &pickup_from=UNIX&pickup_to=UNIX
+//   &drive_min=...&price=...
+//   &lead=30&slack=30&step=10&ret_window=0
+//   &country=de|nl|... (optional)
+
+app.get('/itinerary', async (req, res) => {
+  try {
+    const homeOut = String(req.query.origin || USER_LOCATION).trim();        // home → Start
+    const homeIn  = String(req.query.destination || USER_LOCATION).trim();   // Ziel → home
+
+    const startText = String(
+      req.query.start ||
+      req.query.destinationStart ||
+      req.query.toStart ||
+      ''
+    ).trim();
+
+    const zielText = String(
+      req.query.ziel ||
+      req.query.end ||
+      req.query.toEnd ||
+      ''
+    ).trim();
+
+    if (!startText || !zielText) {
+      return res.status(400).json({ error:'start and ziel are required' });
+    }
+
+    const pickupFrom = parseInt(req.query.pickup_from || '0', 10);
+    const pickupTo   = parseInt(req.query.pickup_to   || '0', 10);
+    const driveMin   = parseInt(req.query.drive_min   || '0', 10);
+    const price      = parseFloat(req.query.price || '0');
+
+    const providerRq = (req.query.provider || 'auto').toLowerCase(); // auto|db|google
+    let providerOutbound = providerRq === 'auto' ? (ENABLE_DB ? 'db' : 'google') : providerRq;
+    let providerReturn   = providerRq === 'auto' ? (ENABLE_DB ? 'db' : 'google') : providerRq;
+    if (!ENABLE_DB && (providerOutbound === 'db' || providerReturn === 'db')) {
+      return res.status(503).json({ status:'DB_DISABLED', message:'DB upstream unavailable. Use provider=google or set ENABLE_DB=1 when DB endpoint is ready.' });
+    }
+
+    const lead  = Math.max(0, parseInt(req.query.lead  || '30', 10));  // minutes before pickup_from
+    const slack = Math.max(0, parseInt(req.query.slack || '30', 10));  // minutes after pickup_to
+    const step  = Math.max(1, parseInt(req.query.step  || '10', 10));
+    const retW  = Math.max(0, parseInt(req.query.ret_window || '0', 10)); // sweep for return
+    const country = (req.query.country || '').toLowerCase();
+
+    // Outbound: arrive-by inside [pickup_from - lead, pickup_to + slack]
+    const baseArrival = pickupTo + slack*60;
+    const windowMinOut = Math.max(0, Math.round((pickupTo + slack*60 - (pickupFrom - lead*60))/60));
+    const out = await sweepBest({
+      provider: providerOutbound,
+      originText: homeOut,
+      destText:   startText,
+      baseTs: baseArrival,
+      windowMin: windowMinOut,
+      stepMin: step,
+      mode: 'arrive',
+      country
+    });
+    if (out.status !== 'OK') return res.status(502).json({ status: out.status, leg:'outbound' });
+
+    // Return: depart after pickup_to + driveMin (or sweep around it if ret_window>0)
+    const baseDepart = pickupTo + driveMin*60;
+    const ret = await sweepBest({
+      provider: providerReturn,
+      originText: zielText,
+      destText:   homeIn,
+      baseTs: baseDepart,
+      windowMin: retW,
+      stepMin: step,
+      mode: 'depart',
+      country
+    });
+    if (ret.status !== 'OK') return res.status(502).json({ status: ret.status, leg:'return' });
+
+    const tOutMin   = Math.round((out.best.duration || 0) / 60);
+    const tBackMin  = Math.round((ret.best.duration || 0) / 60);
+    const transitMin= tOutMin + tBackMin;
+    const totalMin  = transitMin + driveMin;
+    const wage      = totalMin ? (price / (totalMin/60)) : 0;
+
+    function mapsLink(from, to, mode, ts){
+      const u = new URL('https://www.google.com/maps/dir/');
+      u.searchParams.set('api','1');
+      u.searchParams.set('origin', from);
+      u.searchParams.set('destination', to);
+      u.searchParams.set('travelmode','transit');
+      if (ts) u.searchParams.set(mode === 'arrive' ? 'arrival_time' : 'departure_time', String(ts));
+      return u.toString();
+    }
+
+    res.json({
+      status: 'OK',
+      config: { provider: providerRq, lead, slack, step, ret_window: retW, db_enabled: ENABLE_DB },
+      input:  { home_out: homeOut, home_in: homeIn, start: startText, ziel: zielText, pickup_from: pickupFrom, pickup_to: pickupTo, drive_min: driveMin, price },
+      outbound: {
+        provider: out.provider,
+        origin: out.origin,
+        destination: out.destination,
+        chosen_time: out.best.ts,
+        depart: out.best.depart || null,
+        arrive: out.best.arrive || null,
+        duration_minutes: tOutMin,
+        transfers: out.best.transfers ?? null,
+        walk_minutes: out.best.walk ?? null,
+        details: out.best.details,
+        link: mapsLink(homeOut, out.destination, 'arrive', out.best.ts),
+        note: out.note
+      },
+      return: {
+        provider: ret.provider,
+        origin: ret.origin,
+        destination: ret.destination,
+        chosen_time: ret.best.ts,
+        depart: ret.best.depart || null,
+        arrive: ret.best.arrive || null,
+        duration_minutes: tBackMin,
+        transfers: ret.best.transfers ?? null,
+        walk_minutes: ret.best.walk ?? null,
+        details: ret.best.details,
+        link: mapsLink(ret.origin, USER_LOCATION, 'depart', ret.best.ts),
+        note: ret.note
+      },
+      totals: {
+        transit_minutes: transitMin,
+        total_minutes: totalMin,
+        wage_eur_h: +wage.toFixed(2)
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error:'proxy_error', detail: err.message });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+app.listen(PORT, () => console.log(`Proxy listening on ${PORT}`));
