@@ -1,4 +1,4 @@
-// server.js — Transit proxy with arrive-by window sweep (Google Directions)
+// server.js — Transit proxy with arrive-by window sweep (Directions) + geocoding + debug
 const express = require('express');
 const cors = require('cors');
 
@@ -7,12 +7,13 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;                 // set in Vercel
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;  // set in Vercel
 const USER_LOCATION  = process.env.USER_LOCATION || 'Pilotystraße 29, 90408 Nürnberg';
 
 // Health
 app.get('/health', (_, res) => res.json({ ok: true }));
 
+// --- helpers ---
 function parseTs(input) {
   if (input == null) return Math.floor(Date.now() / 1000);
   const v = String(input).trim().toLowerCase();
@@ -22,11 +23,30 @@ function parseTs(input) {
   return Math.floor(Date.now() / 1000);
 }
 
-// Call Google Directions (transit) at a single timestamp
-async function googleTransitOnce({ origin, destination, ts, mode }) {
+// Geocode a free-text address to a place_id (much more reliable for transit)
+async function geocodeToPlaceId(q, country = '') {
+  if (!GOOGLE_API_KEY) throw new Error('GOOGLE_API_KEY missing');
+  const base = 'https://maps.googleapis.com/maps/api/geocode/json';
+  const p = new URLSearchParams({ address: q, key: GOOGLE_API_KEY, language: 'de' });
+  if (country) p.set('components', `country:${country}`);
+  const r = await fetch(`${base}?${p.toString()}`);
+  if (!r.ok) return null;
+  const j = await r.json();
+  const res = j?.results?.[0];
+  if (!res) return null;
+  return { place_id: res.place_id, formatted: res.formatted_address };
+}
+
+// Directions (transit) at a single timestamp, using place_ids when available
+async function googleTransitOnce({ originPid, destPid, ts, mode }) {
   if (!GOOGLE_API_KEY) throw new Error('GOOGLE_API_KEY missing');
   const base = 'https://maps.googleapis.com/maps/api/directions/json';
-  const p = new URLSearchParams({ origin, destination, mode: 'transit', key: GOOGLE_API_KEY });
+  const p = new URLSearchParams({
+    origin: `place_id:${originPid}`,
+    destination: `place_id:${destPid}`,
+    mode: 'transit',
+    key: GOOGLE_API_KEY
+  });
   if (mode === 'arrive') p.set('arrival_time', String(ts));
   else                   p.set('departure_time', String(ts));
 
@@ -64,40 +84,51 @@ async function googleTransitOnce({ origin, destination, ts, mode }) {
 
 // NEW endpoint:
 // /transit?origin=...&destination=...&arrival_time=UNIX | &departure_time=UNIX
-//           &window=90&step=10 (minutes). Defaults: window=60, step=10.
-// Back-compat: still accepts ?ziel=... (origin = USER_LOCATION).
+//           &window=90&step=10&country=de&debug=1
+// Back-compat: ?ziel=... (origin = USER_LOCATION)
 app.get('/transit', async (req, res) => {
   try {
     const legacyZiel = (req.query.ziel || '').trim();
-    const origin = (req.query.origin || (legacyZiel ? USER_LOCATION : '') || USER_LOCATION).trim();
-    const destination = (req.query.destination || legacyZiel || '').trim();
-    if (!destination) return res.status(400).json({ error: 'destination/ziel missing' });
+    const textOrigin = (req.query.origin || (legacyZiel ? USER_LOCATION : '') || USER_LOCATION).trim();
+    const textDest   = (req.query.destination || legacyZiel || '').trim();
+    if (!textDest) return res.status(400).json({ error: 'destination/ziel missing' });
 
-    let baseTs, mode;
-    if (req.query.arrival_time != null) {
-      baseTs = parseTs(req.query.arrival_time); mode = 'arrive';
-    } else if (req.query.departure_time != null) {
-      baseTs = parseTs(req.query.departure_time); mode = 'depart';
-    } else {
-      baseTs = parseTs('now'); mode = 'depart';
-}
+    const mode = (req.query.arrival_time != null) ? 'arrive'
+               : (req.query.departure_time != null) ? 'depart' : 'depart';
+    const baseTs = (mode === 'arrive') ? parseTs(req.query.arrival_time)
+                                       : parseTs(req.query.departure_time);
 
     const windowMin = Math.max(0, parseInt(req.query.window || '60', 10));
     const stepMin   = Math.max(1, parseInt(req.query.step   || '10', 10));
-    const startOff  = (mode === 'arrive') ? -windowMin : 0;
-    const endOff    = (mode === 'arrive') ? 0          : windowMin;
+    const country   = (req.query.country || 'de').toLowerCase();
+    const debug     = (String(req.query.debug || '') === '1');
+
+    // Geocode both ends to place_ids
+    const [o, d] = await Promise.all([
+      geocodeToPlaceId(textOrigin, country),
+      geocodeToPlaceId(textDest,   country)
+    ]);
+    if (!o || !d) {
+      return res.status(400).json({ status: 'GEOCODE_FAIL', origin: !!o, destination: !!d });
+    }
+
+    const startOff = (mode === 'arrive') ? -windowMin : 0;
+    const endOff   = (mode === 'arrive') ? 0          : windowMin;
 
     const candidates = [];
     for (let m = startOff; m <= endOff; m += stepMin) candidates.push(baseTs + m * 60);
 
     const results = [];
+    const trace = [];
     for (const ts of candidates) {
-      const r = await googleTransitOnce({ origin, destination, ts, mode });
+      const r = await googleTransitOnce({ originPid: o.place_id, destPid: d.place_id, ts, mode });
+      if (debug) trace.push({ ts, status: r.status, code: r.code || null });
       if (r.status === 'OK') results.push({ ...r, ts });
     }
 
     if (!results.length) {
-      return res.status(502).json({ status: 'ZERO_RESULTS', message: 'No routes in window' });
+      return res.status(502).json({ status: 'ZERO_RESULTS', message: 'No routes in window',
+                                    origin_geocoded: o, destination_geocoded: d, probed: debug ? trace : undefined });
     }
 
     results.sort((a, b) => a.duration - b.duration);
@@ -106,14 +137,15 @@ app.get('/transit', async (req, res) => {
     return res.json({
       status: 'OK',
       provider: best.provider,
-      origin, destination, mode,
+      origin: o.formatted, destination: d.formatted, mode,
       requested_time: baseTs,
       chosen_time: best.ts,
       duration: best.duration,
       duration_minutes: Math.round(best.duration / 60),
       transfers: best.transfers ?? null,
       walk_minutes: best.walk ?? null,
-      details: best.details || null
+      details: best.details || null,
+      probed: debug ? trace : undefined
     });
   } catch (err) {
     res.status(500).json({ error: 'proxy_error', detail: err.message });
@@ -121,4 +153,3 @@ app.get('/transit', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Proxy listening on ${PORT}`));
-
