@@ -102,7 +102,7 @@ app.get('/transit', async (req, res) => {
 
     const windowMin = Math.max(0, parseInt(req.query.window || '60', 10));
     const stepMin   = Math.max(1, parseInt(req.query.step   || '10', 10));
-    const country   = (req.query.country || 'de').toLowerCase();
+    const country   = (req.query.country || '').toLowerCase(); // '' = no country filter
     const debug     = (String(req.query.debug || '') === '1');
 
     // Geocode both ends to place_ids
@@ -157,4 +157,5 @@ app.get('/transit', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Proxy listening on ${PORT}`));
+
 
