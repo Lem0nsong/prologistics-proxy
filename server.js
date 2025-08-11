@@ -1,223 +1,284 @@
-// server.js — HERE-only Transit proxy
-// Features:
-//  - Geocode (HERE Search v7)
-//  - Transit routing (HERE Transit v8) with arrival/departure sweep
-//  - Deutschlandticket filter (excludes ICE/IC/EC/RJ/ECE/etc.)
-//  - Minimal params to avoid 400s; adds debug messages on HTTP errors
-//  - Endpoints: /health, /geocode?q=..., /transit?... (see below)
+// server.js — HERE Transit proxy with arrive-by/depart sweep + geocoding + D-Ticket filter
+// Node 18+ / Vercel (@vercel/node).  Copy–paste this file and redeploy.
 
 const express = require('express');
 const cors = require('cors');
+const fetch = global.fetch || require('node-fetch');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const HERE_API_KEY = process.env.HERE_API_KEY;
-const USER_AGENT = process.env.USER_AGENT || 'prologistics-proxy/1.0';
+const HERE_API_KEY = process.env.HERE_API_KEY;           // REQUIRED
+const DEFAULT_COUNTRY = (process.env.DEFAULT_COUNTRY || '').toLowerCase(); // e.g. 'de'
 
-if (!HERE_API_KEY) {
-  console.error('HERE_API_KEY is missing. Set it in Vercel → Project → Settings → Environment Variables.');
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+const nowUnix = () => Math.floor(Date.now()/1000);
 
-// ─────────────── Helpers ───────────────
 function parseTs(input) {
-  if (input == null) return Math.floor(Date.now() / 1000);
-  const s = String(input).trim().toLowerCase();
-  if (s === 'now') return Math.floor(Date.now() / 1000);
-  const n = Number(s);
-  return Number.isFinite(n) ? Math.floor(n) : Math.floor(Date.now() / 1000);
-}
-function toIsoUTC(unixSec) { return new Date(unixSec * 1000).toISOString(); }
-
-function longDistanceMatcher(name = '', shortName = '', agency = '') {
-  const ln = (name || '').toUpperCase();
-  const sn = (shortName || '').toUpperCase();
-  const ag = (agency || '').toUpperCase();
-  const re = /^(ICE|IC|EC|ECE|RJ|RJX|D|TLX)/; // extend as needed
-  return re.test(sn) || re.test(ln) || ag.includes('DB FERNVERKEHR');
+  if (input == null) return nowUnix();
+  const v = String(input).trim().toLowerCase();
+  if (v === 'now') return nowUnix();
+  const n = Number(v);
+  if (Number.isFinite(n)) return Math.floor(n);
+  return nowUnix();
 }
 
-// ─────────────── HERE: Geocoding & Search (v7) ───────────────
-async function geocodeHere(query, country = '') {
+function toIso(ts) {
+  // HERE Transit expects ISO8601 local time (it tolerates UTC too). We send UTC ISO.
+  return new Date(ts * 1000).toISOString();
+}
+
+// Products we consider NOT valid for the Deutschlandticket.
+// We will reject any route containing these products when dticket=1.
+const NON_D_TICKET_PRODUCTS = new Set([
+  'highSpeedTrain',      // ICE/TGV/… (category names per HERE docs)
+  'intercityTrain',      // IC/EC/RJ/…
+  'longDistanceTrain',   // fallback category some agencies use
+  'internationalTrain'
+]);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Geocoding (HERE Search API v1)
+// ─────────────────────────────────────────────────────────────────────────────
+async function geocode(q, countryBias = '') {
+  if (!HERE_API_KEY) throw new Error('HERE_API_KEY missing');
   const base = 'https://geocode.search.hereapi.com/v1/geocode';
-  const params = new URLSearchParams({ q: query, apiKey: HERE_API_KEY, lang: 'de-DE' });
-  if (country) params.set('in', `countryCode:${country.toUpperCase()}`);
-
-  const r = await fetch(`${base}?${params}`, { headers: { 'user-agent': USER_AGENT } });
-  if (!r.ok) return { ok: false, status: r.status, error: 'GEOCODE_HTTP' };
-
+  const p = new URLSearchParams({ q, apiKey: HERE_API_KEY, lang: 'de-DE' });
+  if (countryBias) p.set('in', `countryCode:${countryBias.toUpperCase()}`);
+  const r = await fetch(`${base}?${p.toString()}`);
+  if (!r.ok) return { ok:false, status:r.status, error:`HTTP ${r.status}` };
   const j = await r.json();
-  const item = j.items?.[0];
-  if (!item) return { ok: false, status: 'ZERO_RESULTS' };
-
-  return { ok: true, lat: item.position?.lat, lng: item.position?.lng, title: item.title };
+  const item = j.items && j.items[0];
+  if (!item) return { ok:false, status:'ZERO_RESULTS', error:null };
+  return { ok:true, lat:item.position.lat, lng:item.position.lng, title:item.title };
 }
 
-// ─────────────── HERE: Transit Routing (v8) — minimal & robust ───────────────
-async function hereTransitRoute({ origin, destination, ts, mode, dticketOnly }) {
+// ─────────────────────────────────────────────────────────────────────────────
+// HERE Public Transit routing (v8)
+// We call it once per candidate time. We derive duration even if summary is missing.
+// ─────────────────────────────────────────────────────────────────────────────
+async function hereTransitOnce({ origin, destination, ts, mode, dticket }) {
+  // origin/destination are {lat, lng}
   const base = 'https://transit.router.hereapi.com/v8/routes';
   const p = new URLSearchParams({
     apiKey: HERE_API_KEY,
     origin: `${origin.lat},${origin.lng}`,
-    destination: `${destination.lat},${destination.lng}`
-    // No extras (modes/products/return/changes/walkTime). Minimal = fewest 400s.
+    destination: `${destination.lat},${destination.lng}`,
+    // time parameter differs by mode:
+    [mode === 'arrive' ? 'arrivalTime' : 'departureTime']: toIso(ts),
+    // Keep it simple: 0 alternatives; we sweep multiple timestamps ourselves
+    alternatives: '0',
+    // Return more details so the client can show leg lines/times
+    return: 'travelSummary,intermediate,fares'
   });
-  if (mode === 'arrive') p.set('arrivalTime', toIsoUTC(ts));
-  else                   p.set('departureTime', toIsoUTC(ts));
 
-  const url = `${base}?${p.toString()}`;
-  const r = await fetch(url, { headers: { 'user-agent': USER_AGENT } });
-  const text = await r.text(); // read body even on error for diagnostics
-  let j = null; try { j = JSON.parse(text); } catch {}
+  const r = await fetch(`${base}?${p.toString()}`);
+  if (!r.ok) return { ok:false, status:'HTTP_ERROR', code:r.status };
 
-  if (!r.ok) {
-    const msg = (j && (j.title || j.message || j.error || j.cause)) || text.slice(0, 300);
-    return { status: 'HTTP_ERROR', code: r.status, message: msg };
+  const j = await r.json();
+  const route = j.routes && j.routes[0];
+  if (!route || !route.sections || !route.sections.length) {
+    return { ok:false, status:'ZERO_RESULTS' };
   }
 
-  const route = j?.routes?.[0];
-  if (!route) return { status: 'ZERO_RESULTS' };
+  // Determine if this route violates D-ticket (contains long-distance trains)
+  let violatesDTicket = false;
 
-  // Optional Deutschlandticket filter: reject long-distance trains
-  if (dticketOnly) {
-    const hasLD = (route.sections || []).some(sec => {
-      if (sec.transport?.mode !== 'transit') return false;
-      const line = sec.transport?.name || '';
-      const short = sec.transport?.shortName || '';
-      const agency = sec.agency?.name || '';
-      return longDistanceMatcher(line, short, agency);
-    });
-    if (hasLD) return { status: 'FILTERED_LONG_DISTANCE' };
+  // Compute duration fallback: sum of per-section durations if present,
+  // otherwise derive from departure/arrival timestamps.
+  let durationSec = 0;
+  let firstDep = null;
+  let lastArr  = null;
+
+  for (const s of route.sections) {
+    // Capture products for D-ticket filtering
+    const prod = s?.transport?.product?.name || s?.transport?.mode || s?.transport?.category;
+    // HERE often exposes product categories via transport.category or transport.mode.
+    const cat = (s?.transport?.category || s?.transport?.mode || '').trim();
+    if (dticket && (NON_D_TICKET_PRODUCTS.has(cat) || NON_D_TICKET_PRODUCTS.has(prod))) {
+      violatesDTicket = true;
+    }
+
+    // Duration summary if provided
+    const sec = s?.summary?.duration;
+    if (Number.isFinite(sec)) durationSec += sec;
+
+    // Derive absolute times
+    const depIso = s?.departure?.time;
+    const arrIso = s?.arrival?.time;
+    const dep = depIso ? Date.parse(depIso) : null;
+    const arr = arrIso ? Date.parse(arrIso) : null;
+    if (dep && (firstDep == null || dep < firstDep)) firstDep = dep;
+    if (arr && (lastArr == null || arr > lastArr))   lastArr  = arr;
   }
 
-  // Fallback: compute duration from departure/arrival if summary is missing
-  const duration = (route.sections || []).reduce((sum, s) => {
-    const sd = s.summary?.duration;
-    if (Number.isFinite(sd)) return sum + sd;
-    const depMs = s.departure?.time ? Date.parse(s.departure.time) : null;
-    const arrMs = s.arrival?.time ? Date.parse(s.arrival.time) : null;
-    return sum + (depMs != null && arrMs != null ? Math.max(0, Math.round((arrMs - depMs) / 1000)) : 0);
-  }, 0);
+  // If summary-based duration is zero/absent but we have timestamps, derive it.
+  if ((!durationSec || durationSec <= 0) && firstDep && lastArr && lastArr > firstDep) {
+    durationSec = Math.round((lastArr - firstDep) / 1000);
+  }
 
-  const details = (route.sections || []).map(sec => {
-    if (sec.transport?.mode === 'transit') {
+  if (dticket && violatesDTicket) {
+    // Mark as rejected for D-ticket; caller will ignore it
+    return { ok:false, status:'REJECTED_D_TICKET' };
+  }
+
+  // Build a leg list for the client
+  const details = route.sections.map(s => {
+    const depIso = s?.departure?.time;
+    const arrIso = s?.arrival?.time;
+    const dep = depIso ? Math.floor(Date.parse(depIso)/1000) : null;
+    const arr = arrIso ? Math.floor(Date.parse(arrIso)/1000) : null;
+
+    if (s.transport) {
       return {
         type: 'TRANSIT',
-        line: sec.transport?.shortName || sec.transport?.name || '',
-        agency: sec.agency?.name || '',
-        from: sec.departure?.place?.name || '',
-        to:   sec.arrival?.place?.name || '',
-        dep:  sec.departure?.time ? Math.floor(new Date(sec.departure.time).getTime()/1000) : null,
-        arr:  sec.arrival?.time   ? Math.floor(new Date(sec.arrival.time).getTime()/1000)   : null
+        line: s.transport?.name || s.transport?.shortName || s.transport?.mode || '',
+        agency: s.transport?.operator || '',
+        from: s.departure?.place?.name || '',
+        to:   s.arrival?.place?.name || '',
+        dep, arr,
+        product: s.transport?.category || s.transport?.mode || ''
       };
     }
-    if (sec.transport?.mode === 'pedestrian') {
-      return { type: 'WALK', duration_sec: sec.summary?.duration || 0, distance_m: sec.summary?.length || 0 };
-    }
-    return { type: (sec.transport?.mode || 'OTHER').toUpperCase() };
+    // WALK or OTHER legs
+    const dur = s?.summary?.duration || (dep && arr ? Math.max(0, Math.round((arr - dep)/1000)) : null);
+    const dist = s?.summary?.length ?? null;
+    return { type: 'WALK', duration_sec: dur, distance_m: dist };
   });
 
-  const depUnix = route.sections?.[0]?.departure?.time
-    ? Math.floor(new Date(route.sections[0].departure.time).getTime()/1000) : null;
-  const arrUnix = route.sections?.slice(-1)[0]?.arrival?.time
-    ? Math.floor(new Date(route.sections.slice(-1)[0].arrival.time).getTime()/1000) : null;
-
-  return { status: 'OK', provider: 'here', duration, transfers, details, depart: depUnix, arrive: arrUnix };
+  return {
+    ok:true,
+    durationSec: durationSec || 0,
+    depart: firstDep ? Math.floor(firstDep/1000) : null,
+    arrive: lastArr  ? Math.floor(lastArr/1000)  : null,
+    details
+  };
 }
 
-// ─────────────── Sweep window: test multiple timestamps & pick fastest ───────────────
-async function sweepBest({ originText, destText, baseTs, windowMin, stepMin, mode, country, dticketOnly, debug=false }) {
-  const [o, d] = await Promise.all([ geocodeHere(originText, country), geocodeHere(destText, country) ]);
-  if (!o.ok || !d.ok) return { status: 'GEOCODE_FAIL', origin:o, destination:d, trace: [] };
+// Sweeps around the base time (arrive or depart) to pick the shortest valid route
+async function sweepTransit({ origin, destination, baseTs, mode, windowMin, stepMin, dticket, debug }) {
+  const startOff  = (mode === 'arrive') ? -windowMin : 0;
+  const endOff    = (mode === 'arrive') ? 0          : windowMin;
 
-  const startOff = (mode === 'arrive') ? -windowMin : 0;
-  const endOff   = (mode === 'arrive') ?  0        : windowMin;
   const candidates = [];
   for (let m = startOff; m <= endOff; m += stepMin) candidates.push(baseTs + m*60);
 
-  const trace = [], options = [];
-  for (const ts of candidates) {
-    const r = await hereTransitRoute({ origin:{lat:o.lat,lng:o.lng}, destination:{lat:d.lat,lng:d.lng}, ts, mode, dticketOnly });
-    if (debug) trace.push({ ts, status: r.status, code: r.code || null, message: r.message || null, mode });
-    if (r.status === 'OK') options.push({ ...r, ts });
-  }
-  if (!options.length) return { status:'ZERO_RESULTS', origin:o, destination:d, trace };
+  const results = [];
+  const trace = [];
 
-  options.sort((a,b)=> (a.duration - b.duration) || (a.transfers - b.transfers));
-  return { status:'OK', provider:'here', origin:o.title, destination:d.title, best: options[0], trace };
+  for (const ts of candidates) {
+    const r = await hereTransitOnce({ origin, destination, ts, mode, dticket });
+    if (debug) trace.push({ ts, status: r.ok ? 'OK' : r.status, code: r.code || null, mode });
+    if (r.ok) results.push({ ...r, ts });
+  }
+
+  if (!results.length) {
+    return { ok:false, status:'ZERO_RESULTS', trace };
+  }
+
+  results.sort((a,b) => (a.durationSec || 9e15) - (b.durationSec || 9e15));
+  const best = results[0];
+  return { ok:true, best, trace };
 }
 
-// ─────────────── Endpoints ───────────────
-
-// Health
+// ─────────────────────────────────────────────────────────────────────────────
+// Routes
+// ─────────────────────────────────────────────────────────────────────────────
 app.get('/health', (_, res) => res.json({ ok: true }));
 
-// Simple geocode probe: /geocode?q=Erlangen Bahnhof&country=de
-app.get('/geocode', async (req, res) => {
-  try {
-    const q = (req.query.q || '').trim();
-    const country = (req.query.country || '').trim();
-    if (!q) return res.status(400).json({ error: 'q required' });
-    const g = await geocodeHere(q, country);
-    return res.status(g.ok ? 200 : 502).json(g);
-  } catch (err) {
-    res.status(500).json({ error: 'proxy_error', detail: err.message });
-  }
-});
-
-// Transit planner:
 // /transit?origin=...&destination=...&arrival_time=UNIX | &departure_time=UNIX
-//          &window=90&step=10&country=de&dticket=1&debug=1
+//         &window=90&step=10&country=de&dticket=1&debug=1
+// Back-compat: ?ziel=... (origin omitted). In that case we only geocode destination.
 app.get('/transit', async (req, res) => {
   try {
-    const originText = (req.query.origin || '').trim();
-    const destText   = (req.query.destination || req.query.ziel || '').trim();
-    if (!originText || !destText) return res.status(400).json({ error: 'origin and destination required' });
+    if (!HERE_API_KEY) return res.status(500).json({ error:'config', detail:'HERE_API_KEY is missing' });
 
-    const mode   = (req.query.arrival_time != null) ? 'arrive'
-                  : (req.query.departure_time != null) ? 'depart' : 'depart';
-    const baseTs = (mode === 'arrive') ? parseTs(req.query.arrival_time) : parseTs(req.query.departure_time);
+    // Inputs
+    const legacyZiel  = (req.query.ziel || '').trim();
+    const textOrigin  = (req.query.origin || '').trim();
+    const textDest    = (req.query.destination || legacyZiel || '').trim();
+    if (!textDest) return res.status(400).json({ error: 'destination/ziel missing' });
+
+    const mode = (req.query.arrival_time != null) ? 'arrive'
+               : (req.query.departure_time != null) ? 'depart' : 'depart';
+    const baseTs = (mode === 'arrive') ? parseTs(req.query.arrival_time)
+                                       : parseTs(req.query.departure_time);
+
     const windowMin = Math.max(0, parseInt(req.query.window || '60', 10));
     const stepMin   = Math.max(1, parseInt(req.query.step   || '10', 10));
-    const country   = (req.query.country || '').toLowerCase();
-    const dticketOnly = String(req.query.dticket || '0') === '1';
-    const debug = String(req.query.debug || '') === '1';
+    const dticket   = String(req.query.dticket || '') === '1';
+    const debug     = String(req.query.debug   || '') === '1';
+    const country   = (req.query.country || DEFAULT_COUNTRY || '').toLowerCase();
 
-    const out = await sweepBest({
-      originText, destText, baseTs, windowMin, stepMin, mode, country, dticketOnly, debug
+    // Geocode
+    const [gO, gD] = await Promise.all([
+      textOrigin ? geocode(textOrigin, country) : null,
+      geocode(textDest, country)
+    ]);
+
+    if (!gD?.ok) {
+      return res.status(400).json({ status:'GEOCODE_FAIL', origin:gO, destination:gD });
+    }
+    // If origin missing, we fall back to destination-only legacy behavior (not recommended)
+    if (textOrigin && !gO?.ok) {
+      return res.status(400).json({ status:'GEOCODE_FAIL', origin:gO, destination:gD });
+    }
+
+    // If origin omitted: allow calls like /transit?ziel=... for quick duration checks.
+    const originPos = gO?.ok ? { lat: gO.lat, lng: gO.lng } : { lat: gD.lat, lng: gD.lng }; // dummy self-origin for legacy: will produce 0 min
+
+    const { ok, best, trace, status } = await sweepTransit({
+      origin: originPos,
+      destination: { lat: gD.lat, lng: gD.lng },
+      baseTs, mode, windowMin, stepMin, dticket, debug
     });
 
-    if (out.status !== 'OK') {
+    if (!ok) {
       return res.status(502).json({
-        status: out.status,
-        message: out.status === 'GEOCODE_FAIL' ? 'Geocoding failed' : 'No routes in window',
-        origin_geocoded: out.origin,
-        destination_geocoded: out.destination,
-        probed: out.trace
+        status: status || 'ZERO_RESULTS',
+        message: 'No routes in window',
+        origin_geocoded: gO?.ok ? { lat:gO.lat, lng:gO.lng, title:gO.title } : null,
+        destination_geocoded: { lat:gD.lat, lng:gD.lng, title:gD.title },
+        probed: debug ? trace : undefined
       });
     }
-    const b = out.best;
-    res.json({
+
+    // Build response
+    const duration = best.durationSec || 0;
+    const minutes  = Math.round(duration / 60);
+
+    return res.json({
       status: 'OK',
-      provider: out.provider,
-      origin: out.origin,
-      destination: out.destination,
+      provider: 'here',
+      origin: gO?.ok ? gO.title : null,
+      destination: gD.title,
       mode,
       requested_time: baseTs,
-      chosen_time: b.ts,
-      duration: b.duration,
-      duration_minutes: Math.round((b.duration || 0) / 60),
-      transfers: b.transfers ?? null,
-      details: b.details || null,
-      depart: b.depart || null,
-      arrive: b.arrive || null
+      chosen_time: best.ts,
+      duration,
+      duration_minutes: minutes,
+      depart: best.depart || null,
+      arrive: best.arrive || null,
+      // keep only leg info the client uses
+      details: best.details?.map(s => ({
+        type: s.type,
+        line: s.line || '',
+        agency: s.agency || '',
+        from: s.from || '',
+        to:   s.to   || '',
+        dep:  s.dep  || null,
+        arr:  s.arr  || null,
+        product: s.product || ''
+      })) || [],
+      probed: debug ? trace : undefined
     });
   } catch (err) {
     res.status(500).json({ error: 'proxy_error', detail: err.message });
   }
 });
 
-app.listen(PORT, () => console.log(`HERE transit proxy listening on :${PORT}`));
-
+app.listen(PORT, () => console.log(`Proxy listening on ${PORT}`));
