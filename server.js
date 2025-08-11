@@ -133,4 +133,175 @@ async function hereTransitOnce({ origin, destination, ts, mode, dticket }) {
   let lastArr  = null;
 
   for (const s of route.sections) {
-    const prod = s?.transport?.product?.name || s?.tra
+    const prod = s?.transport?.product?.name || s?.transport?.mode || s?.transport?.category;
+    const cat = (s?.transport?.category || s?.transport?.mode || '').trim();
+    if (dticket && (NON_D_TICKET_PRODUCTS.has(cat) || NON_D_TICKET_PRODUCTS.has(prod))) {
+      violatesDTicket = true;
+    }
+
+    const sec = s?.summary?.duration;
+    if (Number.isFinite(sec)) durationSec += sec;
+
+    const depIso = s?.departure?.time;
+    const arrIso = s?.arrival?.time;
+    const dep = depIso ? Date.parse(depIso) : null;
+    const arr = arrIso ? Date.parse(arrIso) : null;
+    if (dep && (firstDep == null || dep < firstDep)) firstDep = dep;
+    if (arr && (lastArr == null || arr > lastArr))   lastArr  = arr;
+  }
+
+  if ((!durationSec || durationSec <= 0) && firstDep && lastArr && lastArr > firstDep) {
+    durationSec = Math.round((lastArr - firstDep) / 1000);
+  }
+
+  if (dticket && violatesDTicket) {
+    return { ok:false, status:'REJECTED_D_TICKET' };
+  }
+
+  const details = route.sections.map(s => {
+    const depIso = s?.departure?.time;
+    const arrIso = s?.arrival?.time;
+    const dep = depIso ? Math.floor(Date.parse(depIso)/1000) : null;
+    const arr = arrIso ? Math.floor(Date.parse(arrIso)/1000) : null;
+
+    if (s.transport) {
+      return {
+        type: 'TRANSIT',
+        line: s.transport?.name || s.transport?.shortName || s.transport?.mode || '',
+        agency: s.transport?.operator || '',
+        from: s.departure?.place?.name || '',
+        to:   s.arrival?.place?.name || '',
+        dep, arr,
+        product: s.transport?.category || s.transport?.mode || ''
+      };
+    }
+    const dur = s?.summary?.duration || (dep && arr ? Math.max(0, Math.round((arr - dep)/1000)) : null);
+    const dist = s?.summary?.length ?? null;
+    return { type: 'WALK', duration_sec: dur, distance_m: dist };
+  });
+
+  return {
+    ok:true,
+    durationSec: durationSec || 0,
+    depart: firstDep ? Math.floor(firstDep/1000) : null,
+    arrive: lastArr  ? Math.floor(lastArr/1000)  : null,
+    details
+  };
+}
+
+// Sweep around base time to pick the shortest valid route
+async function sweepTransit({ origin, destination, baseTs, mode, windowMin, stepMin, dticket, debug }) {
+  const startOff  = (mode === 'arrive') ? -windowMin : 0;
+  const endOff    = (mode === 'arrive') ? 0          : windowMin;
+
+  const candidates = [];
+  for (let m = startOff; m <= endOff; m += stepMin) candidates.push(baseTs + m*60);
+
+  const results = [];
+  const trace = [];
+
+  for (const ts of candidates) {
+    const r = await hereTransitOnce({ origin, destination, ts, mode, dticket });
+    if (debug) trace.push({ ts, status: r.ok ? 'OK' : r.status, code: r.code || null, mode });
+    if (r.ok) results.push({ ...r, ts });
+  }
+
+  if (!results.length) return { ok:false, status:'ZERO_RESULTS', trace };
+
+  results.sort((a,b) => (a.durationSec || 9e15) - (b.durationSec || 9e15));
+  const best = results[0];
+  return { ok:true, best, trace };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Routes
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/health', (_, res) => res.json({ ok: true }));
+
+// /transit?origin=...&destination=...&arrival_time=UNIX | &departure_time=UNIX
+//         &window=90&step=10&country=de&dticket=1&debug=1
+// Back-compat: ?ziel=... (origin omitted). In that case we only geocode destination.
+app.get('/transit', async (req, res) => {
+  try {
+    if (!HERE_API_KEY) return res.status(500).json({ error:'config', detail:'HERE_API_KEY is missing' });
+
+    const legacyZiel  = (req.query.ziel || '').trim();
+    const textOrigin  = (req.query.origin || '').trim();
+    const textDest    = (req.query.destination || legacyZiel || '').trim();
+    if (!textDest) return res.status(400).json({ error: 'destination/ziel missing' });
+
+    const mode = (req.query.arrival_time != null) ? 'arrive'
+               : (req.query.departure_time != null) ? 'depart' : 'depart';
+    const baseTs = (mode === 'arrive') ? parseTs(req.query.arrival_time)
+                                       : parseTs(req.query.departure_time);
+
+    const windowMin = Math.max(0, parseInt(req.query.window || '60', 10));
+    const stepMin   = Math.max(1, parseInt(req.query.step   || '10', 10));
+    const dticket   = String(req.query.dticket || '') === '1';
+    const debug     = String(req.query.debug   || '') === '1';
+    const country   = (req.query.country || DEFAULT_COUNTRY || '').toLowerCase();
+
+    const [gO, gD] = await Promise.all([
+      textOrigin ? geocode(textOrigin, country) : null,
+      geocode(textDest, country)
+    ]);
+
+    if (!gD?.ok) {
+      return res.status(400).json({ status:'GEOCODE_FAIL', origin:gO, destination:gD });
+    }
+    if (textOrigin && !gO?.ok) {
+      return res.status(400).json({ status:'GEOCODE_FAIL', origin:gO, destination:gD });
+    }
+
+    // If origin omitted, dummy self-origin (legacy) → 0 duration
+    const originPos = gO?.ok ? { lat: gO.lat, lng: gO.lng } : { lat: gD.lat, lng: gD.lng };
+
+    const { ok, best, trace, status } = await sweepTransit({
+      origin: originPos,
+      destination: { lat: gD.lat, lng: gD.lng },
+      baseTs, mode, windowMin, stepMin, dticket, debug
+    });
+
+    if (!ok) {
+      return res.status(502).json({
+        status: status || 'ZERO_RESULTS',
+        message: 'No routes in window',
+        origin_geocoded: gO?.ok ? { lat:gO.lat, lng:gO.lng, title:gO.title } : null,
+        destination_geocoded: { lat:gD.lat, lng:gD.lng, title:gD.title },
+        probed: debug ? trace : undefined
+      });
+    }
+
+    const duration = best.durationSec || 0;
+    const minutes  = Math.round(duration / 60);
+
+    return res.json({
+      status: 'OK',
+      provider: 'here',
+      origin: gO?.ok ? gO.title : null,
+      destination: gD.title,
+      mode,
+      requested_time: baseTs,
+      chosen_time: best.ts,
+      duration,
+      duration_minutes: minutes,
+      depart: best.depart || null,
+      arrive: best.arrive || null,
+      details: best.details?.map(s => ({
+        type: s.type,
+        line: s.line || '',
+        agency: s.agency || '',
+        from: s.from || '',
+        to:   s.to   || '',
+        dep:  s.dep  || null,
+        arr:  s.arr  || null,
+        product: s.product || ''
+      })) || [],
+      probed: debug ? trace : undefined
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'proxy_error', detail: err.message });
+  }
+});
+
+app.listen(PORT, () => console.log(`Proxy listening on ${PORT}`));
