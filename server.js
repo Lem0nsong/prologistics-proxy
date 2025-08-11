@@ -105,6 +105,27 @@ async function geocode(q, countryBias = '') {
   return { ok:false, status:'ZERO_RESULTS', error:null, tried:qClean };
 }
 
+const CONCURRENCY = 6;
+
+// tiny promise pool
+async function runPool(items, limit, worker){
+  const results = new Array(items.length);
+  let i = 0, active = 0;
+  return await new Promise((resolve) => {
+    function next(){
+      while (active < limit && i < items.length){
+        const cur = i++;
+        active++;
+        Promise.resolve(worker(items[cur], cur))
+          .then(r => { results[cur] = r; })
+          .catch(() => { results[cur] = null; })
+          .finally(() => { active--; if (i >= items.length && active === 0) resolve(results); else next(); });
+      }
+    }
+    next();
+  });
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // HERE Public Transit routing (v8)
 // We call it once per candidate time. We derive duration even if summary is missing.
@@ -330,4 +351,5 @@ app.get('/transit', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Proxy listening on ${PORT}`));
+
 
