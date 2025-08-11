@@ -41,20 +41,68 @@ const NON_D_TICKET_PRODUCTS = new Set([
   'internationalTrain'
 ]);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Geocoding (HERE Search API v1)
-// ─────────────────────────────────────────────────────────────────────────────
+// Map alpha-2 → alpha-3 (in case you pass ?country=de, etc.)
+const ISO2_TO_3 = { DE:'DEU', AT:'AUT', CH:'CHE', NL:'NLD', BE:'BEL', FR:'FRA', IT:'ITA', ES:'ESP', PT:'PRT', PL:'POL', CZ:'CZE', SK:'SVK', HU:'HUN', DK:'DNK', SE:'SWE', NO:'NOR', FI:'FIN', IE:'IRL', GB:'GBR', LU:'LUX' };
+
+// Keep umlauts etc.; strip control chars/emojis; use first non-empty line; hard cap length.
+function sanitizeQ(q) {
+  const s = String(q || '')
+    .replace(/[\u0000-\u001F\u007F]/g, ' ')      // control chars
+    .replace(/[🧭🚗🚆🚇🚍➡️↔︎→•\u200B-\u200D]/g, ' ') // icons/zwsp
+    .replace(/\s+/g, ' ')
+    .trim();
+  // prefer first lineish chunk and keep it short
+  return s.split(/[|;\n]/)[0].slice(0, 140).trim();
+}
+
 async function geocode(q, countryBias = '') {
   if (!HERE_API_KEY) throw new Error('HERE_API_KEY missing');
+
+  // 1) If user already passed "lat,lng", accept as-is (no geocode).
+  const m = /^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/.exec(String(q||''));
+  if (m) return { ok:true, lat: +m[1], lng: +m[2], title: `${+m[1]},${+m[2]}` };
+
   const base = 'https://geocode.search.hereapi.com/v1/geocode';
-  const p = new URLSearchParams({ q, apiKey: HERE_API_KEY, lang: 'de-DE' });
-  if (countryBias) p.set('in', `countryCode:${countryBias.toUpperCase()}`);
-  const r = await fetch(`${base}?${p.toString()}`);
-  if (!r.ok) return { ok:false, status:r.status, error:`HTTP ${r.status}` };
-  const j = await r.json();
-  const item = j.items && j.items[0];
-  if (!item) return { ok:false, status:'ZERO_RESULTS', error:null };
-  return { ok:true, lat:item.position.lat, lng:item.position.lng, title:item.title };
+  const qClean = sanitizeQ(q);
+  if (!qClean) return { ok:false, status:400, error:'EMPTY_Q', tried:q };
+
+  const up = (countryBias || '').trim().toUpperCase();
+  const iso3 = up.length === 2 ? (ISO2_TO_3[up] || null) : (up.length === 3 ? up : null);
+
+  const makeUrl = (withIn) => {
+    const p = new URLSearchParams({ q: qClean, apiKey: HERE_API_KEY, lang: 'de-DE', limit: '1' });
+    if (withIn && iso3) p.set('in', `countryCode:${iso3}`);
+    return `${base}?${p.toString()}`;
+  };
+
+  // Try with bias then without, then “Discover” fallback
+  for (const url of [ makeUrl(true), makeUrl(false) ]) {
+    const r = await fetch(url);
+    if (!r.ok) {
+      // 400/422 often mean bad 'in' or q — try next attempt
+      if (r.status === 400 || r.status === 422) continue;
+      return { ok:false, status:r.status, error:`HTTP ${r.status}`, tried:qClean };
+    }
+    const j = await r.json();
+    const item = j.items?.[0];
+    if (item?.position) {
+      return { ok:true, lat:item.position.lat, lng:item.position.lng, title:item.title || qClean };
+    }
+  }
+
+  // Last-resort: Discover (a bit looser)
+  const d = new URL('https://discover.search.hereapi.com/v1/discover');
+  d.searchParams.set('q', qClean);
+  d.searchParams.set('apiKey', HERE_API_KEY);
+  d.searchParams.set('limit', '1');
+  const rr = await fetch(d.toString());
+  if (rr.ok) {
+    const jj = await rr.json();
+    const it = jj.items?.[0];
+    if (it?.position) return { ok:true, lat:it.position.lat, lng:it.position.lng, title:it.title || qClean };
+  }
+
+  return { ok:false, status:'ZERO_RESULTS', error:null, tried:qClean };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -282,3 +330,4 @@ app.get('/transit', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Proxy listening on ${PORT}`));
+
