@@ -554,7 +554,46 @@ app.get('/transit', async (req, res) => {
   }
 });
 
+app.get('/drive', async (req, res) => {
+  try{
+    if (!HERE_API_KEY) return res.status(500).json({ status:'CONFIG', error:'HERE_API_KEY missing' });
+    const textOrigin = (req.query.origin || '').trim();
+    const textDest   = (req.query.destination || '').trim();
+    if (!textOrigin || !textDest) return res.status(400).json({ status:'BAD_INPUT' });
+
+    const [gO, gD] = await Promise.all([ geocode(textOrigin, DEFAULT_COUNTRY), geocode(textDest, DEFAULT_COUNTRY) ]);
+    if (!gO?.ok || !gD?.ok) return res.status(400).json({ status:'GEOCODE_FAIL', origin:gO, destination:gD });
+
+    const base = 'https://router.hereapi.com/v8/routes';
+    const p = new URLSearchParams({
+      apiKey: HERE_API_KEY,
+      transportMode: 'car',
+      origin: `${gO.lat},${gO.lng}`,
+      destination: `${gD.lat},${gD.lng}`,
+      return: 'summary',
+      routingMode: 'fast'
+    });
+    const r = await fetch(`${base}?${p.toString()}`);
+    if (!r.ok) return res.status(502).json({ status:'HTTP_ERROR', code:r.status });
+
+    const j = await r.json();
+    const route = j.routes?.[0];
+    let dur = 0;
+    if (route?.sections?.length){
+      for (const s of route.sections){
+        const sec = s.summary?.duration || 0;
+        if (Number.isFinite(sec)) dur += sec;
+      }
+    }
+    const minutes = Math.round((dur||0)/60);
+    return res.json({ status:'OK', duration_seconds:dur||0, duration_minutes:minutes });
+  }catch(e){
+    return res.status(500).json({ status:'ERR', error:e.message });
+  }
+});
+
 app.listen(PORT, () => console.log(`Proxy listening on ${PORT}`));
+
 
 
 
