@@ -141,6 +141,142 @@ const GEO_INFLIGHT = new Map();   // key: q|iso3  → Promise
 const TRN_CACHE = new Map();      // key: o|d|mode|ts|dticket → value
 const TRN_INFLIGHT = new Map();   // key: same → Promise
 
+// ─── Overpass / Sixt lookup (free tier) ───────────────────────────────────────
+const OSM_OVERPASS_URL = process.env.OSM_OVERPASS_URL || 'https://overpass-api.de/api/interpreter';
+const SIXT_CACHE = new Map();   // key: lat,lng,day → value
+const SIXT_CACHE_MAX = 1000;
+
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const toRad = (d) => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+function weekdayLocal(ts){
+  // 0=Sun..6=Sat → map to OSM tokens
+  const d = new Date(ts * 1000);
+  const idx = d.getDay(); // 0..6
+  const MAP = ['Su','Mo','Tu','We','Th','Fr','Sa'];
+  return { token: MAP[idx], y: d.getFullYear(), m: d.getMonth()+1, d: d.getDate() };
+}
+
+function parseOpeningHoursForDay(oh, dayToken){
+  // Tiny parser covering the common cases: "Mo-Fr 08:00-20:00; Sa 09:00-14:00; Su off", "24/7"
+  if (!oh || typeof oh !== 'string') return null;
+  const s = oh.trim();
+  if (/24\s*\/\s*7/.test(s)) return { open: '00:00', close: '23:59' };
+
+  // Normalize separators
+  const parts = s.split(';').map(t => t.trim()).filter(Boolean);
+  const DAY = ['Mo','Tu','We','Th','Fr','Sa','Su'];
+
+  const dayIndex = DAY.indexOf(dayToken);
+  if (dayIndex < 0) return null;
+
+  function tokenCoversDay(token){
+    token = token.trim();
+    if (token === dayToken) return true;
+    // Ranges like "Mo-Fr" or "Sa-Su"
+    const m = /^([A-Z][a-z])\s*-\s*([A-Z][a-z])$/.exec(token);
+    if (m){
+      const a = DAY.indexOf(m[1]);
+      const b = DAY.indexOf(m[2]);
+      if (a >= 0 && b >= 0){
+        if (a <= b) return dayIndex >= a && dayIndex <= b;
+        // wrap-around ranges like "Fr-Mo"
+        return (dayIndex >= a) || (dayIndex <= b);
+      }
+    }
+    // Comma lists "Mo,We,Fr"
+    if (token.includes(',')){
+      return token.split(',').map(t => t.trim()).includes(dayToken);
+    }
+    // Single "Su" or "off"
+    if (/^(PH|off)$/i.test(token)) return false;
+    return token === dayToken;
+  }
+
+  for (const rule of parts){
+    // Split day spec and hour spec
+    // Examples:
+    //  "Mo-Fr 08:00-20:00"
+    //  "Sa 09:00-14:00"
+    //  "Su off"
+    const m = /^([^0-9]*?)\s*(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})/i.exec(rule);
+    if (m){
+      const daysSpec = m[1].trim() || dayToken;
+      const open = m[2];
+      const close = m[3];
+      // daysSpec can be "Mo-Fr", "Tu,Th", "Mo"
+      const chunks = daysSpec.split(',').map(x=>x.trim()).filter(Boolean);
+      if (chunks.length === 0) chunks.push(dayToken);
+      for (const ch of chunks){
+        if (tokenCoversDay(ch)) return { open, close };
+      }
+    } else if (new RegExp(`\\b${dayToken}\\b`).test(rule) && /\boff\b/i.test(rule)) {
+      return null; // explicitly closed
+    }
+  }
+  return null;
+}
+
+async function findSixtNear({lat, lng}, ts){
+  // 2km search radius; includes node/way/relation with brand/operator "Sixt"
+  const radius = 2000;
+  const q = `
+[out:json][timeout:25];
+(
+  node["shop"="car_rental"]["brand"~"(?i)sixt"](around:${radius},${lat},${lng});
+  node["shop"="car_rental"]["operator"~"(?i)sixt"](around:${radius},${lat},${lng});
+  way["shop"="car_rental"]["brand"~"(?i)sixt"](around:${radius},${lat},${lng});
+  way["shop"="car_rental"]["operator"~"(?i)sixt"](around:${radius},${lat},${lng});
+  relation["shop"="car_rental"]["brand"~"(?i)sixt"](around:${radius},${lat},${lng});
+  relation["shop"="car_rental"]["operator"~"(?i)sixt"](around:${radius},${lat},${lng});
+);
+out center 20;
+  `.trim();
+
+  const key = `${lat.toFixed(5)},${lng.toFixed(5)}|${Math.floor(ts/86400)}`;
+  const cached = lruGet(SIXT_CACHE, key);
+  if (cached) return cached;
+
+  const r = await fetch(OSM_OVERPASS_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+    body: new URLSearchParams({ data: q }).toString()
+  }).catch(()=>null);
+
+  if (!r || !r.ok) return null;
+  const j = await r.json().catch(()=>null);
+  const elements = j?.elements || [];
+  if (!elements.length) return null;
+
+  // Map to (lat,lng)
+  const candidates = elements.map(e => {
+    const cen = e.center || e; // node has lat/lon; way/relation has center
+    const name = e.tags?.name || e.tags?.brand || e.tags?.operator || 'Sixt';
+    const oh = e.tags?.opening_hours || '';
+    return {
+      lat: cen.lat, lng: cen.lon, name, opening_hours: oh,
+      dist: haversineKm(lat, lng, cen.lat, cen.lon)
+    };
+  }).sort((a,b)=>a.dist-b.dist);
+
+  const nearest = candidates[0];
+  const { token } = weekdayLocal(ts);
+  const parsed = parseOpeningHoursForDay(nearest.opening_hours, token);
+  const val = {
+    lat: nearest.lat, lng: nearest.lng, name: nearest.name,
+    open_hhmm: parsed?.open || '08:00',
+    close_hhmm: parsed?.close || '20:00'
+  };
+  lruSet(SIXT_CACHE, key, val, SIXT_CACHE_MAX);
+  return val;
+}
+
 function lruGet(map, key){ if (!map.has(key)) return undefined; const v = map.get(key); map.delete(key); map.set(key, v); return v; }
 function lruSet(map, key, val, max){
   if (map.has(key)) map.delete(key);
@@ -283,6 +419,34 @@ async function sweepTransit({ origin, destination, baseTs, mode, windowMin, step
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/health', (_, res) => res.json({ ok: true }));
 
+// Find nearest Sixt and its opening window for the given date (free via OSM)
+app.get('/sixt_opening', async (req, res) => {
+  try{
+    const near = (req.query.near || '').trim();
+    const date = parseTs(req.query.date);
+    if (!near) return res.status(400).json({ ok:false, error:'near required' });
+
+    // Parse "lat,lng" or geocode text
+    let lat=null, lng=null;
+    const m = /^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/.exec(near);
+    if (m) { lat = +m[1]; lng = +m[2]; }
+    else {
+      const g = await geocode(near, (req.query.country || DEFAULT_COUNTRY || '').toLowerCase());
+      if (!g?.ok) return res.json({ ok:false, reason:'GEOCODE_FAIL' });
+      lat = g.lat; lng = g.lng;
+    }
+
+    const found = await findSixtNear({ lat, lng }, date);
+    if (found){
+      return res.json({ ok:true, ...found });
+    }
+    // No Sixt nearby → caller should fall back to offer start with default hours
+    return res.json({ ok:false });
+  } catch (e){
+    return res.status(500).json({ ok:false, error:'sixt_opening_failed', detail: e.message });
+  }
+});
+
 // /transit?origin=...&destination=...&arrival_time=UNIX | &departure_time=UNIX
 //         &window=90&step=10&country=de&dticket=1&debug=1
 // Back-compat: ?ziel=... (origin omitted). In that case we only geocode destination.
@@ -370,5 +534,6 @@ app.get('/transit', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Proxy listening on ${PORT}`));
+
 
 
