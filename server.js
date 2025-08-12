@@ -160,7 +160,6 @@ async function inflight(key, bag, maker){
 // HERE Public Transit (v8)
 // ─────────────────────────────────────────────────────────────────────────────
 async function hereTransitOnce({ origin, destination, ts, mode, dticket }) {
-  // origin/destination are {lat, lng}
   const base = 'https://transit.router.hereapi.com/v8/routes';
   const p = new URLSearchParams({
     apiKey: HERE_API_KEY,
@@ -168,22 +167,9 @@ async function hereTransitOnce({ origin, destination, ts, mode, dticket }) {
     destination: `${destination.lat},${destination.lng}`,
     [mode === 'arrive' ? 'arrivalTime' : 'departureTime']: toIso(ts),
     alternatives: '0',
-    // 'summary' may not always be present on transit; we derive from timestamps if needed
     return: 'travelSummary,intermediate,fares'
   });
 
-  async function hereTransitOnceCached(args){
-  const { origin, destination, ts, mode, dticket } = args;
-  const key = `${origin.lat.toFixed(5)},${origin.lng.toFixed(5)}|${destination.lat.toFixed(5)},${destination.lng.toFixed(5)}|${mode}|${ts}|${dticket?'1':'0'}`;
-  const cached = lruGet(TRN_CACHE, key);
-  if (cached) return cached;
-  return await inflight(key, TRN_INFLIGHT, async () => {
-    const r = await hereTransitOnce(args);
-    lruSet(TRN_CACHE, key, r, TRN_CACHE_MAX);
-    return r;
-  });
-}
-  
   const r = await fetch(`${base}?${p.toString()}`);
   if (!r.ok) return { ok:false, status:'HTTP_ERROR', code:r.status };
 
@@ -251,6 +237,18 @@ async function hereTransitOnce({ origin, destination, ts, mode, dticket }) {
     arrive: lastArr  ? Math.floor(lastArr/1000)  : null,
     details
   };
+}
+
+async function hereTransitOnceCached(args){
+  const { origin, destination, ts, mode, dticket } = args;
+  const key = `${origin.lat.toFixed(5)},${origin.lng.toFixed(5)}|${destination.lat.toFixed(5)},${destination.lng.toFixed(5)}|${mode}|${ts}|${dticket?'1':'0'}`;
+  const cached = lruGet(TRN_CACHE, key);
+  if (cached) return cached;
+  return await inflight(key, TRN_INFLIGHT, async () => {
+    const r = await hereTransitOnce(args);
+    lruSet(TRN_CACHE, key, r, TRN_CACHE_MAX);
+    return r;
+  });
 }
 
 async function sweepTransit({ origin, destination, baseTs, mode, windowMin, stepMin, dticket, debug }) {
@@ -372,4 +370,5 @@ app.get('/transit', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Proxy listening on ${PORT}`));
+
 
