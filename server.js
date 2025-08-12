@@ -32,6 +32,22 @@ function toIso(ts) {
   return new Date(ts * 1000).toISOString();
 }
 
+async function runPool(items, limit, worker){
+  const out = new Array(items.length);
+  let i = 0, active = 0, done = 0;
+  return await new Promise(res=>{
+    function next(){
+      while(active < limit && i < items.length){
+        const idx = i++; active++;
+        Promise.resolve(worker(items[idx], idx))
+          .then(v => { out[idx] = v; })
+          .finally(()=>{ active--; done++; if (done === items.length) res(out); else next(); });
+      }
+    }
+    next();
+  });
+}
+
 // Products we consider NOT valid for the Deutschlandticket.
 // We will reject any route containing these products when dticket=1.
 const NON_D_TICKET_PRODUCTS = new Set([
@@ -54,13 +70,12 @@ function sanitizeQ(q) {
   return s.split(/[|;\n]/)[0].slice(0, 140).trim();
 }
 
-// Geocoding (HERE Search v1) with robust fallback + country bias handling
 async function geocode(q, countryBias = '') {
   if (!HERE_API_KEY) throw new Error('HERE_API_KEY missing');
 
-  // 1) Accept "lat,lng" directly
+  // 1) Accept "lat,lng"
   const m = /^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/.exec(String(q||''));
-  if (m) return { ok:true, lat: +m[1], lng: +m[2], title: `${+m[1]},${+m[2]}` };
+  if (m) return { ok:true, lat:+m[1], lng:+m[2], title:`${+m[1]},${+m[2]}` };
 
   const base = 'https://geocode.search.hereapi.com/v1/geocode';
   const qClean = sanitizeQ(q);
@@ -68,40 +83,77 @@ async function geocode(q, countryBias = '') {
 
   const up = (countryBias || '').trim().toUpperCase();
   const iso3 = up.length === 2 ? (ISO2_TO_3[up] || null) : (up.length === 3 ? up : null);
+  const cacheKey = `${qClean}|${iso3||''}`;
 
-  const makeUrl = (withIn) => {
-    const p = new URLSearchParams({ q: qClean, apiKey: HERE_API_KEY, lang: 'de-DE', limit: '1' });
-    if (withIn && iso3) p.set('in', `countryCode:${iso3}`);
-    return `${base}?${p.toString()}`;
-  };
+  const cached = lruGet(GEO_CACHE, cacheKey);
+  if (cached) return cached;
 
-  // Try with bias then without
-  for (const url of [ makeUrl(true), makeUrl(false) ]) {
-    const r = await fetch(url);
-    if (!r.ok) {
-      if (r.status === 400 || r.status === 422) continue; // try next attempt
-      return { ok:false, status:r.status, error:`HTTP ${r.status}`, tried:qClean };
+  return await inflight(cacheKey, GEO_INFLIGHT, async () => {
+    const makeUrl = (withIn) => {
+      const p = new URLSearchParams({ q: qClean, apiKey: HERE_API_KEY, lang: 'de-DE', limit: '1' });
+      if (withIn && iso3) p.set('in', `countryCode:${iso3}`);
+      return `${base}?${p.toString()}`;
+    };
+
+    for (const url of [ makeUrl(true), makeUrl(false) ]) {
+      const r = await fetch(url);
+      if (r.ok) {
+        const j = await r.json();
+        const it = j.items?.[0];
+        if (it?.position) {
+          const val = { ok:true, lat:it.position.lat, lng:it.position.lng, title:it.title || qClean };
+          lruSet(GEO_CACHE, cacheKey, val, GEO_CACHE_MAX);
+          return val;
+        }
+      } else if (r.status !== 400 && r.status !== 422) {
+        const val = { ok:false, status:r.status, error:`HTTP ${r.status}`, tried:qClean };
+        lruSet(GEO_CACHE, cacheKey, val, GEO_CACHE_MAX);
+        return val;
+      }
     }
-    const j = await r.json();
-    const item = j.items?.[0];
-    if (item?.position) {
-      return { ok:true, lat:item.position.lat, lng:item.position.lng, title:item.title || qClean };
+
+    // Discover fallback
+    const d = new URL('https://discover.search.hereapi.com/v1/discover');
+    d.searchParams.set('q', qClean);
+    d.searchParams.set('apiKey', HERE_API_KEY);
+    d.searchParams.set('limit', '1');
+    const rr = await fetch(d.toString());
+    if (rr.ok) {
+      const jj = await rr.json();
+      const it = jj.items?.[0];
+      if (it?.position) {
+        const val = { ok:true, lat:it.position.lat, lng:it.position.lng, title:it.title || qClean };
+        lruSet(GEO_CACHE, cacheKey, val, GEO_CACHE_MAX);
+        return val;
+      }
     }
-  }
+    const val = { ok:false, status:'ZERO_RESULTS', error:null, tried:qClean };
+    lruSet(GEO_CACHE, cacheKey, val, GEO_CACHE_MAX);
+    return val;
+  });
+}
 
-  // Last resort: Discover (looser)
-  const d = new URL('https://discover.search.hereapi.com/v1/discover');
-  d.searchParams.set('q', qClean);
-  d.searchParams.set('apiKey', HERE_API_KEY);
-  d.searchParams.set('limit', '1');
-  const rr = await fetch(d.toString());
-  if (rr.ok) {
-    const jj = await rr.json();
-    const it = jj.items?.[0];
-    if (it?.position) return { ok:true, lat:it.position.lat, lng:it.position.lng, title:it.title || qClean };
-  }
+// ─── Caches ───────────────────────────────────────────────────────────────────
+const GEO_CACHE_MAX = 2000;
+const TRN_CACHE_MAX = 4000;
+const GEO_CACHE = new Map();      // key: q|iso3  → value
+const GEO_INFLIGHT = new Map();   // key: q|iso3  → Promise
+const TRN_CACHE = new Map();      // key: o|d|mode|ts|dticket → value
+const TRN_INFLIGHT = new Map();   // key: same → Promise
 
-  return { ok:false, status:'ZERO_RESULTS', error:null, tried:qClean };
+function lruGet(map, key){ if (!map.has(key)) return undefined; const v = map.get(key); map.delete(key); map.set(key, v); return v; }
+function lruSet(map, key, val, max){
+  if (map.has(key)) map.delete(key);
+  map.set(key, val);
+  if (map.size > max) map.delete(map.keys().next().value);
+}
+
+// Small promise de-dup wrapper
+async function inflight(key, bag, maker){
+  if (bag.has(key)) return bag.get(key);
+  const p = (async()=>{ try{ return await maker(); } finally { bag.delete(key); } })();
+  bag.set(key, p);
+  return p;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -120,6 +172,18 @@ async function hereTransitOnce({ origin, destination, ts, mode, dticket }) {
     return: 'travelSummary,intermediate,fares'
   });
 
+  async function hereTransitOnceCached(args){
+  const { origin, destination, ts, mode, dticket } = args;
+  const key = `${origin.lat.toFixed(5)},${origin.lng.toFixed(5)}|${destination.lat.toFixed(5)},${destination.lng.toFixed(5)}|${mode}|${ts}|${dticket?'1':'0'}`;
+  const cached = lruGet(TRN_CACHE, key);
+  if (cached) return cached;
+  return await inflight(key, TRN_INFLIGHT, async () => {
+    const r = await hereTransitOnce(args);
+    lruSet(TRN_CACHE, key, r, TRN_CACHE_MAX);
+    return r;
+  });
+}
+  
   const r = await fetch(`${base}?${p.toString()}`);
   if (!r.ok) return { ok:false, status:'HTTP_ERROR', code:r.status };
 
@@ -189,28 +253,31 @@ async function hereTransitOnce({ origin, destination, ts, mode, dticket }) {
   };
 }
 
-// Sweep around base time to pick the shortest valid route
 async function sweepTransit({ origin, destination, baseTs, mode, windowMin, stepMin, dticket, debug }) {
-  const startOff  = (mode === 'arrive') ? -windowMin : 0;
-  const endOff    = (mode === 'arrive') ? 0          : windowMin;
+  // Cap probes to keep things fast
+  const MAX_PROBES = 8; // <=8 requests per sweep
+  const effStep = Math.max(stepMin || 10, Math.ceil((windowMin || 60) / MAX_PROBES));
+
+  const startOff = (mode === 'arrive') ? -windowMin : 0;
+  const endOff   = (mode === 'arrive') ? 0          : windowMin;
 
   const candidates = [];
-  for (let m = startOff; m <= endOff; m += stepMin) candidates.push(baseTs + m*60);
+  for (let m = startOff; m <= endOff; m += effStep) candidates.push(baseTs + m*60);
+  if (candidates.length === 0) candidates.push(baseTs);
 
-  const results = [];
   const trace = [];
-
-  for (const ts of candidates) {
-    const r = await hereTransitOnce({ origin, destination, ts, mode, dticket });
+  const worker = async (ts) => {
+    const r = await hereTransitOnceCached({ origin, destination, ts, mode, dticket });
     if (debug) trace.push({ ts, status: r.ok ? 'OK' : r.status, code: r.code || null, mode });
-    if (r.ok) results.push({ ...r, ts });
-  }
+    return r.ok ? { ...r, ts } : null;
+  };
 
+  // Run in a small pool to increase throughput without hammering the API
+  const results = (await runPool(candidates, 4, worker)).filter(Boolean);
   if (!results.length) return { ok:false, status:'ZERO_RESULTS', trace };
 
   results.sort((a,b) => (a.durationSec || 9e15) - (b.durationSec || 9e15));
-  const best = results[0];
-  return { ok:true, best, trace };
+  return { ok:true, best: results[0], trace };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -305,3 +372,4 @@ app.get('/transit', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Proxy listening on ${PORT}`));
+
