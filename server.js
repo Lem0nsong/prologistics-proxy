@@ -406,11 +406,32 @@ async function sweepTransit({ origin, destination, baseTs, mode, windowMin, step
     return r.ok ? { ...r, ts } : null;
   };
 
-  // Run in a small pool to increase throughput without hammering the API
+// Run in a small pool to increase throughput without hammering the API
   const results = (await runPool(candidates, 4, worker)).filter(Boolean);
   if (!results.length) return { ok:false, status:'ZERO_RESULTS', trace };
 
-  results.sort((a,b) => (a.durationSec || 9e15) - (b.durationSec || 9e15));
+  // Prefer "arrive as close as possible to baseTs (not later)", then shorter
+  // For depart-after: prefer the earliest depart >= baseTs, then shorter
+  function score(r) {
+    if (mode === 'arrive') {
+      const arr = r.arrive ?? 0;
+      const tooLate = arr > baseTs ? 1 : 0;                // disqualify if after target
+      const earliness = arr <= baseTs ? (baseTs - arr) : 1e12;
+      return [tooLate, earliness, r.durationSec || 9e15];
+    } else {
+      const dep = r.depart ?? r.ts;
+      const beforeBase = dep < baseTs ? 1 : 0;             // penalize departing before base
+      const wait = dep >= baseTs ? (dep - baseTs) : 1e12;  // smaller wait is better
+      return [beforeBase, wait, r.durationSec || 9e15];
+    }
+  }
+
+  results.sort((a,b) => {
+    const sa = score(a), sb = score(b);
+    for (let i=0;i<sa.length;i++){ if (sa[i]!==sb[i]) return sa[i]-sb[i]; }
+    return 0;
+  });
+
   return { ok:true, best: results[0], trace };
 }
 
@@ -534,6 +555,7 @@ app.get('/transit', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Proxy listening on ${PORT}`));
+
 
 
 
