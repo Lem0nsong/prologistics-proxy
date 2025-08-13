@@ -50,6 +50,7 @@ async function runPool(items, limit, worker){
 
 // Products we consider NOT valid for the Deutschlandticket.
 // We will reject any route containing these products when dticket=1.
+// Compare against section.transport.category (lowercased)
 const NON_D_TICKET_PRODUCTS = new Set([
   'highSpeedTrain',      // ICE/TGV/…
   'intercityTrain',      // IC/EC/RJ/…
@@ -102,7 +103,7 @@ async function geocode(q, countryBias = '') {
         const it = j.items?.[0];
         if (it?.position) {
           const val = { ok:true, lat:it.position.lat, lng:it.position.lng, title:it.title || qClean };
-          lruSet(GEO_CACHE, cacheKey, val, GEO_CACHE_MAX);
+          lruSet(GEO_CACHE, cacheKey, val, GEO_CACHE_MAX, GEO_NEG_TTL_MS);
           return val;
         }
       } else if (r.status !== 400 && r.status !== 422) {
@@ -123,12 +124,12 @@ async function geocode(q, countryBias = '') {
       const it = jj.items?.[0];
       if (it?.position) {
         const val = { ok:true, lat:it.position.lat, lng:it.position.lng, title:it.title || qClean };
-        lruSet(GEO_CACHE, cacheKey, val, GEO_CACHE_MAX);
+        lruSet(GEO_CACHE, cacheKey, val, GEO_CACHE_MAX, GEO_NEG_TTL_MS);
         return val;
       }
     }
     const val = { ok:false, status:'ZERO_RESULTS', error:null, tried:qClean };
-    lruSet(GEO_CACHE, cacheKey, val, GEO_CACHE_MAX);
+    lruSet(GEO_CACHE, cacheKey, val, GEO_CACHE_MAX, GEO_NEG_TTL_MS);
     return val;
   });
 }
@@ -136,6 +137,8 @@ async function geocode(q, countryBias = '') {
 // ─── Caches ───────────────────────────────────────────────────────────────────
 const GEO_CACHE_MAX = 2000;
 const TRN_CACHE_MAX = 4000;
+const GEO_NEG_TTL_MS = parseInt(process.env.GEO_NEG_TTL_MS || '', 10) || 5 * 60 * 1000; // 5m
+const TRN_NEG_TTL_MS = parseInt(process.env.TRN_NEG_TTL_MS || '', 10) || 2 * 60 * 1000; // 2m
 const GEO_CACHE = new Map();      // key: q|iso3  → value
 const GEO_INFLIGHT = new Map();   // key: q|iso3  → Promise
 const TRN_CACHE = new Map();      // key: o|d|mode|ts|dticket → value
@@ -277,10 +280,31 @@ out center 20;
   return val;
 }
 
-function lruGet(map, key){ if (!map.has(key)) return undefined; const v = map.get(key); map.delete(key); map.set(key, v); return v; }
-function lruSet(map, key, val, max){
+// TTL-aware LRU helpers (backwards compatible)
+function lruGet(map, key){
+  if (!map.has(key)) return undefined;
+  const entry = map.get(key);
+
+  // TTL wrapper?
+  if (entry && typeof entry === 'object' && entry.__ttl === true) {
+    if (entry.exp && Date.now() > entry.exp) { map.delete(key); return undefined; }
+    // touch (LRU) and return unboxed value
+    map.delete(key); map.set(key, entry);
+    return entry.val;
+  }
+
+  // legacy non-wrapped value
+  map.delete(key); map.set(key, entry);
+  return entry;
+}
+
+function lruSet(map, key, val, max, ttlMs){
+  let store = val;
+  if (Number.isFinite(ttlMs) && ttlMs > 0) {
+    store = { __ttl: true, exp: Date.now() + ttlMs, val };
+  }
   if (map.has(key)) map.delete(key);
-  map.set(key, val);
+  map.set(key, store);
   if (map.size > max) map.delete(map.keys().next().value);
 }
 
@@ -317,12 +341,18 @@ async function hereTransitOnce({ origin, destination, ts, mode, dticket }) {
   let durationSec = 0;
   let firstDep = null;
   let lastArr  = null;
-
+  
   for (const s of route.sections) {
-    const prod = s?.transport?.product?.name || s?.transport?.mode || s?.transport?.category;
-    const cat = (s?.transport?.category || s?.transport?.mode || '').trim();
-    if (dticket && (NON_D_TICKET_PRODUCTS.has(cat) || NON_D_TICKET_PRODUCTS.has(prod))) {
-      violatesDTicket = true;
+    const catLower  = String(s?.transport?.category || s?.transport?.mode || '').toLowerCase().trim();
+    const nameLower = String(s?.transport?.name || s?.transport?.shortName || '').toLowerCase();
+    if (dticket) {
+      if (NON_D_TICKET_PRODUCTS.has(catLower)) {
+        violatesDTicket = true;
+      }
+      // Also catch common brand names if category is missing/misclassified
+      if (/(^|\s)(ice|tgv|ece|ec|ic|rj|railjet|nj)(\s|$)/i.test(nameLower)) {
+        violatesDTicket = true;
+      }
     }
 
     const sec = s?.summary?.duration;
@@ -382,7 +412,8 @@ async function hereTransitOnceCached(args){
   if (cached) return cached;
   return await inflight(key, TRN_INFLIGHT, async () => {
     const r = await hereTransitOnce(args);
-    lruSet(TRN_CACHE, key, r, TRN_CACHE_MAX);
+    const ttl = r && r.ok === false ? TRN_NEG_TTL_MS : undefined;
+    lruSet(TRN_CACHE, key, r, TRN_CACHE_MAX, ttl);
     return r;
   });
 }
@@ -593,6 +624,7 @@ app.get('/drive', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Proxy listening on ${PORT}`));
+
 
 
 
