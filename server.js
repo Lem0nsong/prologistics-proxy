@@ -49,13 +49,11 @@ async function runPool(items, limit, worker){
 }
 
 // Products we consider NOT valid for the Deutschlandticket.
-// We will reject any route containing these products when dticket=1.
-// Compare against section.transport.category (lowercased)
 const NON_D_TICKET_PRODUCTS = new Set([
-  'highSpeedTrain',      // ICE/TGV/…
-  'intercityTrain',      // IC/EC/RJ/…
-  'longDistanceTrain',   // fallback category some agencies use
-  'internationalTrain'
+  'highspeedtrain',
+  'intercitytrain',
+  'longdistancetrain',
+  'internationaltrain'
 ]);
 
 // Map alpha-2 → alpha-3 (if ?country=de etc.)
@@ -624,6 +622,7 @@ app.get('/drive', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Proxy listening on ${PORT}`));
+
 
 
 
